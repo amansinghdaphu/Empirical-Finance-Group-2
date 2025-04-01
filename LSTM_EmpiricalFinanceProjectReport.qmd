@@ -1,0 +1,315 @@
+---
+title: "LSTM Modell"
+format: html
+editor: 
+    {
+        visual: true,
+        render-on-save: true
+    }
+# editor: visual
+jupyter: python3
+---
+
+# Deep learning approach
+
+​In the paper, "Forecasting S&P 500 Using LSTM Models," Pilla and Mekonen demonstrate that while ARIMA models can effectively capture short-term trends in S&P 500 forecasting, their linear assumptions limit their ability to model the non-linear dependencies in the data. They propose that modern machine learning and deep learning approaches, particularly Long Short-Term Memory (LSTM) networks, are better suited for capturing both short-term and long-term trends in financial data. (<https://arxiv.org/html/2501.17366v1>)
+
+Building on this insight, we will implement an LSTM neural network to predict future S&P 500 prices. Our approach involves using historical daily closing prices in a sliding window framework, adjusting the window size to observe its impact on the results. The model will be trained on daily data to leverage the large quantity of data points, as LSTMs require substantial data for effective training and may underperform with limited datasets like monthly data. Furthermore, we will convert the predicted prices into continuously compounded returns to create a better comparison with the ARIMA model's results.​
+
+## Environment setup
+
+We begin by setting up our Python environment, importing the necessary packages, and setting the seed for all packages used by TensorFlow and Keras to ensure reproducibility.
+
+```{python}
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import yfinance as yf
+import tensorflow as tf
+
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout, Input
+from tensorflow.keras.callbacks import EarlyStopping
+
+from tensorflow.keras.metrics import RootMeanSquaredError, MeanAbsoluteError
+
+from sklearn.preprocessing import MinMaxScaler
+```
+
+```{python}
+random_state=42
+tf.keras.utils.set_random_seed(random_state)
+
+train_period, val_period, test_period = ("1990-12-30", "2020-01-01"), ("2020-01-02", "2021-01-01"), ("2021-01-02", "2025-03-21")
+```
+
+## Data
+
+As already noted, for this part, we decided to use daily closing prices of the S&P500 imported from yahoo finance. As defined above, we start our testing period 30.December 1990, and finish it 1. January 2020. The next years datapoints will be used for validation data when training the model, while the last 4 years will be used as testing data to evaluate the performance of the model.
+
+```{python}
+interval = "1d"
+data = yf.download("^GSPC", interval=interval, start=train_period[0], end=test_period[1])[["Close"]]
+data[["LogReturns"]] = np.log(data[["Close"]] / data[["Close"]].shift(1))
+data.dropna(inplace=True) 
+data.head()
+```
+
+Next, we split the data into training, validation and testing parts in the previously defined periods.
+
+```{python}
+train_df, val_df, test_df = data.loc[train_period[0]:train_period[1]], data.loc[val_period[0]:val_period[1]], data.loc[test_period[0]:test_period[1]]
+
+print(f"There are {len(train_df)} samples in the training set, {len(val_df)} samples in the validation set, and {len(test_df)} samples in the test set.")
+```
+
+### Inspecting the data
+
+We can first have a look at the historical prices of the S&P500.
+
+```{python}
+plt.figure(figsize=(14, 7))
+plt.plot(train_df.index, train_df[["Close"]], label="Training set")
+plt.plot(val_df.index, val_df[["Close"]], label="Validation set")
+plt.plot(test_df.index, test_df[["Close"]], label="Test set")
+plt.xlabel("Date")
+plt.ylabel("Closing price")
+plt.title("S&P 500 Index")
+plt.legend()
+plt.show()
+```
+
+And also see the log returns we will try to recreate.
+
+```{python}
+plt.figure(figsize=(14, 7))
+plt.plot(train_df.index, train_df[["LogReturns"]], label="Training set")
+plt.plot(val_df.index, val_df[["LogReturns"]], label="Validation set")
+plt.plot(test_df.index, test_df[["LogReturns"]], label="Test set")
+plt.xlabel("Date")
+plt.ylabel("Returns")
+plt.title("S&P 500 Index")
+plt.legend()
+plt.show()
+```
+
+## Preprocessing the data
+
+In order to create a model that accurately can predict future prices, we will scale the closing price history. This is to avoid that the model does not focus to much on large values and discriminate against low values. This will also prevent outliers to dominate the errors of the model.
+
+```{python}
+scaler = MinMaxScaler()
+train_scaled = scaler.fit_transform(train_df[["Close"]])
+val_scaled = scaler.transform(val_df[["Close"]])
+test_scaled = scaler.transform(test_df[["Close"]])
+```
+
+We will also define a function that we will use to create the sequences to be given as input to the LSTM model. This takes the price history value, as well as the wanted length of the sequence.
+
+```{python}
+def create_sequences(X, len_sequences=20):
+    Xs, ys = [], []
+    for i in range(len_sequences, len(X)):
+        Xs.append(X[i-len_sequences:i, 0])
+        ys.append(X[i, 0])
+
+    Xs, ys = np.array(Xs), np.array(ys)
+    Xs = np.reshape(Xs, (Xs.shape[0], Xs.shape[1], 1))
+    
+    return Xs, ys
+```
+
+We define the sequence length as a tunable parameter, allowing us to evaluate the model's performance across different window sizes.
+
+```{python}
+seq_len = 80
+```
+
+Next, the create_sequences function is called to create the sequences to be used with the model.
+
+```{python}
+X_train, y_train = create_sequences(train_scaled, len_sequences=seq_len)
+X_val, y_val = create_sequences(val_scaled, len_sequences=seq_len)
+X_test, y_test = create_sequences(test_scaled, len_sequences=seq_len)
+```
+
+## Model definition
+
+As mentioned in the paper by Pilla and Mekonen, a simple LSTM model with two LSTM layers together with dropout layers to prevent overfitting, togheter with a single dense layer to create the prediction creates a good model to predict future prices. The model will also be implemented with the optimizer Adam, where we will try to minimize the loss function "mean squared error". This will help penalize larger errors and create a model that focuses on minimizing significant deviations in the predicitons. We will also keep track of the root mean squared error and the mean absolute error of the model to inspect its performance.
+
+```{python}
+model = Sequential([
+    Input(shape=(X_train.shape[1], X_train.shape[2])),
+    LSTM(64, return_sequences=True),
+    Dropout(0.2),
+    LSTM(64, return_sequences=False),
+    Dropout(0.2),
+    Dense(1)
+])
+
+model.compile(optimizer='adam', loss='mean_squared_error', metrics=[RootMeanSquaredError(), MeanAbsoluteError()])
+
+early_stopping = EarlyStopping(monitor='val_loss', patience=15, mode='min', restore_best_weights=True)
+
+print(model.summary())
+```
+
+## Training and loading the model
+
+Attached, we have provided model weights that can be used with this model. It is also possible to train the model by setting the do_train parameter to true. To use the attached model weights, set the parameters to match the wanted model.
+
+```{python}
+do_train = False
+epochs = 100
+batch_size = 32
+run_name = f"sp500_{epochs}epochs_{batch_size}bs_{seq_len}seqlen_earlystopping"
+
+if do_train:
+    model.fit(
+        x=X_train,
+        y=y_train,
+        epochs=epochs,
+        batch_size=batch_size,
+        validation_data=(X_val, y_val),
+        callbacks=[early_stopping],
+        verbose=1
+    )
+
+    model.save_weights(f"{run_name}.weights.h5")
+else:
+    model.load_weights(f"{run_name}.weights.h5")
+```
+
+## Predicting using the chosen model
+
+We feed the model with the testing dataset, and transform the predicted prices back into the original scale. We also calculate the daily log returns to compare with the true daily returns.
+
+```{python}
+preds = model.predict(X_test)
+preds = scaler.inverse_transform(preds)
+
+test_dates = data.index[-len(y_test):]
+predictions_df = pd.DataFrame({'Date': test_dates, 'Predictions': preds.flatten()})
+predictions_df[["LogReturns"]] = np.log(predictions_df[["Predictions"]] / predictions_df[["Predictions"]].shift(1))
+predictions_df.dropna(inplace=True)
+predictions_df.set_index('Date', inplace=True)
+predictions_df.head()
+```
+
+## Visualization of results
+
+Then we plot the daily price movements to see the the predicted price against the true price.
+
+Using the 100 epochs, 32 batch size, and sequence length of 80 gives the model reasonable performance. Especially for the earlier stages of the testing period, the model is able to quite accurately follow the true price of the S&P500. AS we move into the later stages, from about January 2024, we and there is a large jump in the true value, the model struggles to predict the same scale as the true price.
+
+```{python}
+plt.figure(figsize=(14, 7))
+plt.plot(predictions_df.index, test_df[["Close"]][seq_len+1:], label="True")
+plt.plot(predictions_df.index, predictions_df[["Predictions"]], label="Predictions")
+plt.legend()
+plt.show()
+```
+
+When it comes to the daily returns, we see that the model is quite accurate of following the same patterns and signs as the true value, however, it struggles slightly when it comes to hitting the correct scale.
+
+```{python}
+plt.figure(figsize=(14, 7))
+plt.plot(predictions_df.index, test_df[["LogReturns"]][seq_len+1:], label="True")
+plt.plot(predictions_df.index, predictions_df[["LogReturns"]], label="Predictions")
+plt.legend()
+plt.show()
+```
+
+We can also take a look at the performance metrics of the predicted prices and returns.
+
+```{python}
+mae = MeanAbsoluteError()
+mae.update_state(test_df[["Close"]][seq_len+1:], predictions_df[["Predictions"]])
+print(f"Mean Absolute Error: {mae.result().numpy():.3f}")
+
+rmse = RootMeanSquaredError()
+rmse.update_state(test_df[["Close"]][seq_len+1:], predictions_df[["Predictions"]])
+print(f"Root Mean Squared Error: {rmse.result().numpy():.3f}")
+
+accuracy = 100 - (mae.result().numpy() / test_df[["Close"]].mean() * 100)
+print(f"Accuracy: {accuracy.values[0]:.3f}%")
+```
+
+```{python}
+mae = MeanAbsoluteError()
+mae.update_state(test_df[["LogReturns"]][seq_len+1:], predictions_df[["LogReturns"]])
+print(f"Mean Absolute Error: {mae.result().numpy():.3f}")
+
+rmse = RootMeanSquaredError()
+rmse.update_state(test_df[["LogReturns"]][seq_len+1:], predictions_df[["LogReturns"]])
+print(f"Root Mean Squared Error: {rmse.result().numpy():.3f}")
+```
+
+## Transforming to monthly predictions
+
+Going back to our research question, we wanted to investigate if we could accurately model monthly returns. We therefore have to transform the daily predictions into monthly. To do this, we decided to test three different techniques.
+
+1.  First predicted price. Using the first predicted price of each month as the representative monthly price.
+
+2.  Last predicted price. Using the last predicted price of the month instead.
+
+3.  Average of predictions. Taking the average of all daily predicted prices within a given month.
+
+There are multiple advantages and disadvantages predicting daily prices and transforming them to monthly.
+
+#### Advantages
+
+The use of daily prices suits well with the large demand of datapoints to create an accurate LSTM model. However, daily predictions tend to be more volatile than monthly. Transforming these using key points and/or averaging them out reduces the short-term noise.
+
+#### Disadvantages
+
+By modeling the daily prices, we will miss some monthly trends. Furthermore, this might produce a model which is unable ti accurately able to predict the prices due to the highly volatilie daily prices. The choice between the transformation technique will also give different results which will introduce uncertainty in the results.
+
+Finally, we also gather the monthly data from yahoo finance, to compare the transformed predictions.
+
+```{python}
+monthly_preds_first = predictions_df[["Predictions"]].resample('ME').first()
+monthly_preds_last = predictions_df[["Predictions"]].resample('ME').last()
+monthly_preds_avg = predictions_df[["Predictions"]].resample('ME').mean()
+
+monthly_returns_first = np.log(monthly_preds_first / monthly_preds_first.shift(1))
+monthly_returns_first.dropna(inplace=True)
+monthly_returns_last = np.log(monthly_preds_last / monthly_preds_last.shift(1))
+monthly_returns_last.dropna(inplace=True)
+monthly_returns_avg = np.log(monthly_preds_avg / monthly_preds_avg.shift(1))
+monthly_returns_avg.dropna(inplace=True)
+
+monthly_prices = yf.download("^GSPC", interval="1mo", start=test_period[0], end=test_period[1])[["Close"]]
+monthly_prices["LogReturns"] = np.log(monthly_prices[["Close"]] / monthly_prices[["Close"]].shift(1))
+monthly_prices.dropna(inplace=True)
+```
+
+## Visualization of monthly results
+
+To finalize, we can visualize the results of the transformation and compare them to the real results.
+
+```{python}
+plt.figure(figsize=(14, 7))
+plt.plot(monthly_prices.index, monthly_prices[["Close"]], label="True (Monthly)")
+plt.plot(monthly_preds_last.index, monthly_preds_last, label="Predictions (Last of Month)")
+plt.plot(monthly_preds_first.index, monthly_preds_first, label="Predictions (First of Month)")
+plt.plot(monthly_preds_avg.index, monthly_preds_avg, label="Predictions (Monthly Avg)")
+plt.legend()
+plt.show()
+```
+
+Using the model with 100 epochs, 32 batch size, and sequence length of 80, we can see taht the different transformation techniques creates pretty similar results. Similarily to the daily results, the model performs best in the earlier period, and when the true monthly price increases the model struggles to create good results.
+
+Based on the results in the plot, it seems like the transformation does not play a big role in the results of the model. This suggests that the models predictive power is more affected of shifts in the trends than in the transformation technique we use in the model
+
+```{python}
+plt.figure(figsize=(14, 7))
+plt.plot(monthly_prices.index, monthly_prices[["LogReturns"]], label="True (Monthly)")
+plt.plot(monthly_returns_last.index, monthly_returns_last, label="LogReturns (Last of Month)")
+plt.plot(monthly_returns_first.index, monthly_returns_first, label="LogReturns (First of Month)")
+plt.plot(monthly_returns_avg.index, monthly_returns_avg, label="LogReturns (Monthly Avg)")
+plt.legend()
+plt.show()
+```
+
+When it comes to the resulting predicted returns, it again seems that the choice of transformation model does not play an important role. Moreover, as we can see from the plot, the model is actually able to quite accurately predict the expected returns when the monthly returns is at a reasonable level.
