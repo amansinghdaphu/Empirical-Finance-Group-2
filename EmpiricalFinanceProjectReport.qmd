@@ -1,0 +1,480 @@
+---
+title: "EmpiricalFinanceProjectGroup2"
+format: html
+editor: visual
+---
+
+# S&P 500 monthly returns forecasting
+
+In this report, we will attempt to forecast monthly S&P 500 returns. The S&P 500 is one of the most widely followed equity indicies in the world, representing a benchmark for the U.S stock market and overall economic performance - this makes it an interesting time series to forecast.
+
+In order to do this, we will first consider the use of an ARMA model. We will then use a machine learning model using LSTMs. Finally, we will compare the performance of the two. This will allow us to evaluate whether more advanced techniques offer any improvements over classical methods.
+
+Our problem statement therefore becomes: To what extent can average monthly S&P 500 returns be accurately forecasted using historical data from 2015 to 2024?
+
+## Import and prepare data
+
+In this assignment, we used historical S&P 500 data from Yahoo Finance. The date column was converted to proper date format, and the data sorted chronologically. The daily data was grouped by month and the last available trading date was selected for each month, as we wanted monthly frequency.
+
+```{r}
+
+# load needed libraries
+library(dplyr)
+library(lubridate)
+library(readr)
+
+
+df <- read_csv("SP&500Historical.csv")  
+
+# ensure Date is in correct format
+df <- df %>%
+  mutate(Date = mdy(Date)) %>%
+  arrange(Date)  # Ensure in chronological order
+
+# extract year-month
+df <- df %>%
+  mutate(YearMonth = floor_date(Date, "month"))
+
+# select last row of each month
+monthly_last_close <- df %>%
+  group_by(YearMonth) %>%
+  slice_tail(n = 1) %>%
+  ungroup()
+
+# rename for clarity
+monthly_last_close <- monthly_last_close %>%
+  rename(Last_Close = `Close/Last`)
+
+# keeping only YearMonth and Last_Close columns
+monthly_last_close <- monthly_last_close %>%
+  select(YearMonth, Last_Close)
+
+
+
+```
+
+```{r}
+
+# setting plot appearance
+par(cex.axis = 1.5, cex.lab = 1.5, lwd = 2)
+
+# plotting the closing price
+plot(monthly_last_close$YearMonth,
+     monthly_last_close$Last_Close,
+     type = "l",
+     col = "steelblue",
+     xlab = "Date",
+     ylab = "S&P 500 Closing Price",
+     main = "S&P 500 Last Closing Price Each Month")
+
+# add box around the plot
+box()
+
+
+```
+
+The graph above shows the last closing price of the S&P 500 for each month from 2015 to 2025. The price series illustrates the non-stationary nature of financial data, with both the level and volatility changing over time. Overall, there is a clear upward trend reflecting long-term economic growth, but the series also shows periods of decline and increased volatility.
+
+We choose to forecast SP500 returns. Return time series are generally more stationary meaning their statistical properties—such as mean and variance—are more likely to remain constant over time. This is crucial for most forecasting models. Returns also allows for comparison across time periods and assets. Price time series on the other hand often follow a non-stationary random walk, making them more difficult to model accurately without differentiating or transformation. Prices are also more difficult to compare across time periods due to scale and long-term trends driven by factors such as inflation and economic growth. Forecasting returns improves model reliability due to the properties of the time series, and provides insights that are directly useful for financial analysis and decision making.
+
+```{r}
+# computing log returns for last monthly close
+monthly_last_close <- monthly_last_close %>%
+  mutate(Return = c(NA, diff(log(Last_Close))))
+
+# set plotting parameters
+par(cex.axis = 1.5, cex.lab = 1.5, lwd = 2)
+
+# plot return series
+plot(monthly_last_close$YearMonth,
+     monthly_last_close$Return,
+     type = "l",
+     col = "darkblue",
+     xlab = "Date",
+     ylab = "Monthly Log Return (%)",
+     main = "S&P 500 Monthly Returns (Last Closing Price)")
+
+
+abline(h = 0, col = "gray", lty = 2)
+
+box()
+
+mean_log_return <- mean(monthly_last_close$Return, na.rm = TRUE)
+cat("Average Monthly Log Return:", round(mean_log_return * 100, 2), "%\n")
+
+median_log_return <- median(monthly_last_close$Return, na.rm = TRUE)
+cat("Median Monthly Log Return:", round(median_log_return * 100, 2), "%\n")
+
+
+```
+
+The graph shows the monthly log returns of the S&P 500 based on the last closing price each month. Unlike the price series, returns fluctuate around a relatively constant mean with no clear trend, supporting the assumption of stationarity. Spikes in volatility are visible, particularly around early 2020, likely reflecting the market impact of the COVID-19 pandemic.
+
+We used log returns as opposed to simple returns because log returns offer several advantages. They are time-additive, meaning returns over multiple periods can be summed, which simplifies analysis. Log returns also naturally account for the compounding effect by calculating the natural logarithm of the ratio of the asset’s final price to its initial price. Additionally, log returns often exhibit better statistical properties than simple returns, such as a closer approximation to normality, which is desirable in many forecasting models, including ARMA models. A closer approximation to normality is beneficial for ARMA models because it leads to more efficient and unbiased parameter estimates, more reliable hypothesis testing and confidence intervals, and more effective model diagnostics, helping to detect misspecification.
+
+As we had daily data but wanted to model returns at a monthly frequency, we used the last closing price of each month. This is a common and practical method for aggregating high-frequency data, providing a consistent and representative value for each period. It ensures a uniform frequency across the dataset, and also helps smooth out some of the short-term noise and volatility present in daily prices.
+
+```{r}
+# plot histogram of monthly log returns
+hist(monthly_last_close$Return,
+     main = "Histogram of Monthly S&P 500 Returns",
+     xlab = "Monthly Log Return",
+     col = "lightblue",
+     border = "white",
+     breaks = 20)  
+
+box()
+
+```
+
+The histogram of monthly log returns displays a shape that is approximately normally distributed, with the most frequent returns clustered around small positive values. The diagram includes the full range of observed monthly returns, though a few outliers deviate from the normal distribution. One notable example is the most negative return, which corresponds to the onset of the COVID pandemic in March 2020.
+
+## Testing for unit roots
+
+Before fitting ARMA models, it is important to test the stationarity of the underlying data. This is because ARMA models assume that the input time series is stationary - if the data is not stationary, forecasts and model diagnostics can be unreliable. To address this, a unit root test was conducted, first on the S&P 500 price data, and then on the log returns to test if each series was stationary or not. We believe that the price time series will be non-stationary, and log returns stationary, but it is important to verify this.
+
+```{r}
+library(fUnitRoots)
+
+# test for unit root in price series (non-stationary expected)
+adfTest(monthly_last_close$Last_Close, lags = 12, type = "c")  # 'c' = constant (drift)
+
+# test for unit root in monthly log return series
+adfTest(monthly_last_close$Return, lags = 12, type = "c")
+
+# DF-GLS test on price series
+adfgls <- urersTest(monthly_last_close$Last_Close, 
+                    type = "DF-GLS", 
+                    model = "trend", 
+                    lag.max = 12)
+
+# view test statistic and critical values
+adfgls@test$test@teststat
+adfgls@test$test@cval
+
+
+```
+
+First an ADF test for the monthly closing price was conducted. The output shows that we cannot reject the null hypothesis for the closing price time series, because the p-value is at 0.9376, above the critical value of 0.05. This means that the time series contains at least one unit root and is therefore non-stationary.
+
+Next, we ran an ADF test for the monthly log returns. The output shows that we can indeed reject the null hypothesis because the p-value is at 0.03194, which is lower than the 5% critical level. This indicates that we should use the monthly log returns in our ARMA model.
+
+```{r}
+monthly_last_close$Return
+
+returns <- monthly_last_close$Return
+returns <- returns[-1]  
+
+# ACF plot (Autocorrelation Function)
+acf(returns, lag.max = 12, main = "ACF of Monthly Returns")
+
+# PACF plot (Partial Autocorrelation Function)
+pacf(returns, lag.max = 12, main = "PACF of Monthly Returns")
+
+
+```
+
+The ACF results show that autocorrelations decline quickly, with only a small spike at lag 1 and most other lags falling within the 95% confidence bounds. This suggests that the return series is not highly persistent and lacks strong autocorrelation, meaning past returns have little predictive power for future returns. We used lag.max = 12 to examine correlations up to one year. Using 12 lags for monthly data is standard practice.
+
+The PACF results similarly show no significant partial autocorrelations. In a purely random return series, we expect both ACF and PACF values to lie within the confidence bands at most lags, which appears to be the case here. The lack of significant autocorrelation indicates that new information is quickly reflected in prices, making return forecasting challenging. These findings suggest that past return information has limited predictive power, as returns appear to follow a largely random pattern.
+
+The slight differences between ACF and PACF behavior are expected. While the ACF captures the overall correlation across multiple lags, the PACF isolates the direct effect of a specific lag after accounting for previous ones. These plots are useful tools for identifying the appropriate model order in time series forecasting. In this case, both ACF and PACF suggest that a low-order ARMA model may be sufficient.
+
+## Model selection
+
+To select the most appropriate model for the monthly log return series, we evaluated multiple model specifications based on the AIC and BIC information criteria.
+
+```{r}
+# create  array to store AIC and BIC values
+aic_table <- array(NA, c(6, 6, 2))  # [p+1, q+1, AIC/BIC]
+
+# loop through combinations of p and q
+# choosing 0-5 to get a range of model specifications
+for (p in 0:5) {
+  for (q in 0:5) {
+    model <- tryCatch(
+      arima(returns, order = c(p, 0, q)),
+      error = function(e) NULL
+    )
+    
+    if (!is.null(model)) {
+      aic_table[p + 1, q + 1, 1] <- AIC(model)  # AIC
+      aic_table[p + 1, q + 1, 2] <- AIC(model, k = log(length(returns)))  # BIC
+    }
+  }
+}
+
+# AIC table
+aic_table[, , 1]
+
+# BIC table
+aic_table[, , 2]
+
+# Find best AIC and BIC model
+which.min(aic_table[, , 1])  # AIC
+which.min(aic_table[, , 2])  # BIC
+
+
+```
+
+From the information criteria results, we see that the minimum AIC value occurs when an ARMA(4,4) model is fitted to the data. The minimum BIC value occurs with an ARMA(0,0) model. Given that BIC has a stricter complexity penalty, the different models proposed through the AIC and BIC make sense.
+
+An ARMA(0,0) model represents a white noise process where returns are assumed to be independent and identically distributed around a constant mean. This implies that the S&P 500 returns are unpredictable and follow a random walk with constant drift, which also makes sense according to the EMH. However, given that AIC allows for more model complexity, which may be relevant to try and capture some patterns in the data, we also wanted to proceed with the ARMA(4,4) model. As such, decided to fit both an ARMA(4,4) and ARMA(0,0) model to the data and compare them.
+
+## Forecasting
+
+First, we created a forecast using the ARMA(4,4) model. We implemented both dynamic and static (rolling one-step-ahead) forecasts over the final 21 months of the sample (i.e., out-of-sample period from August 2023 to March 2025).
+
+For the dynamic forecast, the model was trained once on the in-sample period, and then the resulting model was used to produce a multi-step ahead forecast over the 21-month out-of-sample horizon. For the static forecast, in each out-of-sample month, the model is re-estimated using all available data up to that point. Next, a single one-step-ahead forecast is generated - this process is repeated for each of the 21 months in the out-of-sample window. The reason for using both static and dynamic forecasts was so that we could compare the performance of the two.
+
+Finally, we plotted the dynamic and static forecasts against the actual returns. Visually, the static and dynamic forecasts appear quite similar overall. In certain periods - for example, September 2024 - the forecasts align well with the actual returns. However, in other months, both forecasts diverge noticeably from the observed values. This suggests that while the model occasionally captures return movements, its predictive power may be limited and somewhat inconsistent over time.
+
+```{r}
+
+# fit ARMA(4,4) model on in-sample data
+ar44 <- arima(monthly_last_close$Return[monthly_last_close$YearMonth <= as.Date("2023-07-01")], order = c(4, 0, 4))
+
+# dynamic Forecast (21 months ahead)
+dynamic_fc <- predict(ar44, n.ahead = 21)
+
+# split data
+n_total <- nrow(monthly_last_close)
+n_oos <- 21
+n_is <- n_total - n_oos
+
+in_sample <- monthly_last_close[1:n_is, ]
+out_sample <- monthly_last_close[(n_is + 1):n_total, ]
+
+# static Forecast – rolling one-step-ahead forecast
+static_fc <- numeric(n_oos)
+
+for (i in 1:n_oos) {
+  train_data <- monthly_last_close$Return[1:(n_is + i - 1)]
+  model <- arima(train_data, order = c(4, 0, 4))
+  static_fc[i] <- predict(model, n.ahead = 1)$pred[1]
+}
+
+# forecast Dates
+forecast_dates <- monthly_last_close$YearMonth[(n_is + 1):n_total]
+
+# plot actual vs forecasts
+par(lwd = 2, cex.axis = 1.2)
+plot(forecast_dates,
+     monthly_last_close$Return[(n_is + 1):n_total],
+     type = "l", col = "black", xlab = "", ylab = "Monthly Return",
+     main = "ARMA(4,4): Actual vs Dynamic vs Static Forecast")
+
+lines(forecast_dates, dynamic_fc$pred, col = "blue", lty = 2)
+lines(forecast_dates, static_fc, col = "red", lty = 3)
+
+legend("topright",
+       legend = c("Actual", "Dynamic Forecast", "Static Forecast"),
+       col = c("black", "blue", "red"),
+       lty = c(1, 2, 3))
+
+
+```
+
+The same forecasting process was repeated for the ARMA(0,0) model. As expected, the graph shows flat lines for the forecasts of the returns in both the static and the dynamic case (with a constant return of just above 0, which makes sense given the drift term). The next step is to compare the performance of the ARMA(0,0) and ARMA(4,4) model forecasts, and see if a more complex ARMA(4,4) model actually does generate better forecasts than the random walk model.
+
+```{r}
+# fit ARMA(0,0) model on in-sample data
+ar00 <- arima(monthly_last_close$Return[monthly_last_close$YearMonth <= as.Date("2023-07-01")], order = c(0, 0, 0))
+
+# dynamic Forecast (21 months ahead)
+dynamic_fc_00 <- predict(ar00, n.ahead = 21)
+
+# split data
+n_total <- nrow(monthly_last_close)
+n_oos <- 21
+n_is <- n_total - n_oos
+
+in_sample <- monthly_last_close[1:n_is, ]
+out_sample <- monthly_last_close[(n_is + 1):n_total, ]
+
+# static Forecast – rolling one-step-ahead forecast
+static_fc_00 <- numeric(n_oos)
+
+for (i in 1:n_oos) {
+  train_data <- monthly_last_close$Return[1:(n_is + i - 1)]
+  model <- arima(train_data, order = c(0, 0, 0))
+  static_fc_00[i] <- predict(model, n.ahead = 1)$pred[1]
+}
+
+# forecast Dates
+forecast_dates <- monthly_last_close$YearMonth[(n_is + 1):n_total]
+
+# plot actual vs forecasts
+par(lwd = 2, cex.axis = 1.2)
+plot(forecast_dates,
+     monthly_last_close$Return[(n_is + 1):n_total],
+     type = "l", col = "black", xlab = "", ylab = "Monthly Return",
+     main = "ARMA(0,0): Actual vs Dynamic vs Static Forecast")
+
+lines(forecast_dates, dynamic_fc_00$pred, col = "blue", lty = 2)
+lines(forecast_dates, static_fc_00, col = "red", lty = 3)
+
+legend("topright",
+       legend = c("Actual", "Dynamic Forecast", "Static Forecast"),
+       col = c("black", "blue", "red"),
+       lty = c(1, 2, 3))
+```
+
+```{r}
+# just checking to see what values are outputted - there is indeed a drift term
+print(dynamic_fc_00)
+```
+
+## Evaluating forecasts
+
+For forecast accuracy metrics we computed RMSE, MAE and MAPE. These metrics help evaluate how close our forecasts are to the actual returns. RMSE penalizes larger errors more heavily, making it useful when large deviations are more costly. MAE treats all forecast errors equally and is more robust to outliers, providing a balanced view of average performance. MAPE expresses forecast error as a percentage, which enhances interpretability across scales. However, it can be misleading when applied to return series. Since returns often is close to zero, the percentage error can become extremely large due to division by a very small number. This can make MAPE relatively noisy and unreliable in the context of return forecasting.
+
+```{r}
+# load libraries
+library(forecast)
+library(MCS)  # for DM test function
+
+# ensure actual values are numeric
+actual <- as.numeric(monthly_last_close$Return[101:121])
+
+dynamic_fc_list <- predict(ar44, n.ahead = 21)  # list output
+dynamic_fc <- as.numeric(dynamic_fc_list$pred)  # extract numeric predictions
+
+# forecast accuracy metrics, using RMSE, MAE and MAPE
+rmse_dynamic <- sqrt(mean((actual - dynamic_fc)^2, na.rm = TRUE))
+mae_dynamic <- mean(abs(actual - dynamic_fc), na.rm = TRUE)
+mape_dynamic <- mean(abs((actual - dynamic_fc) / actual), na.rm = TRUE) * 100
+
+rmse_static <- sqrt(mean((actual - static_fc)^2, na.rm = TRUE))
+mae_static <- mean(abs(actual - static_fc), na.rm = TRUE)
+mape_static <- mean(abs((actual - static_fc) / actual), na.rm = TRUE) * 100
+
+# print results
+cat("Forecast Accuracy Metrics:\n")
+cat("Dynamic Forecast - RMSE:", round(rmse_dynamic, 6),
+    "| MAE:", round(mae_dynamic, 6),
+    "| MAPE:", round(mape_dynamic, 2), "%\n")
+
+cat("Static Forecast  - RMSE:", round(rmse_static, 6),
+    "| MAE:", round(mae_static, 6),
+    "| MAPE:", round(mape_static, 2), "%\n")
+
+# Diebold-Mariano Test 
+dm_test <- dm.test((actual - dynamic_fc)^2, (actual - static_fc)^2,
+                   alternative = "two.sided", h = 1, power = 2)
+
+# print DM test results
+cat("\nDiebold-Mariano Test:\n")
+cat("Test Statistic:", round(dm_test$statistic, 4), "\n")
+cat("p-value:", round(dm_test$p.value, 4), "\n")
+
+# interpretation, using critical value at 0.05
+if (dm_test$p.value < 0.05) {
+  cat("Significant difference in forecast accuracy. Lower error method is statistically better.\n")
+} else {
+  cat("No statistically significant difference between dynamic and static forecasts.\n")
+}
+
+```
+
+The forecast accuracy metrics are influenced by the scale of the time series. Since we are working with returns expressed in decimal form, the error values can be interpreted as deviations in percentage points. For example, an RMSE of 0.040009 implies an average error of about 4.00 percentage points. The MAPE values are relatively high, which is expected in return forecasting, as even small absolute errors can produce large percentage errors when actual returns are close to zero.
+
+The RMSE was around 3.6%–4.0% - this makes sense given that we are modeling an unpredictable time series (monthly stock returns), which are noisy.
+
+A Diebold-Mariano test was conducted to compare the forecasting performance of the dynamic and static forecasts generated from the model. The output shows a p-value of 0.2901, indicating that the difference in forecast accuracy between the two methods (static and dynamic) is not statistically significant. This suggests that, over the 21-month out-of-sample period, both forecasting approaches performed similarly.
+
+```{r}
+# load libraries 
+library(forecast)
+library(MCS)  # For DM test function
+
+# ensure actual values numeric
+actual_00 <- as.numeric(monthly_last_close$Return[101:121])
+
+dynamic_fc_list_00 <- predict(ar00, n.ahead = 21)  # list output
+dynamic_fc_00 <- as.numeric(dynamic_fc_list_00$pred)  # extract numeric predictions
+
+# forecast accuracy metrics, using RMSE, MAE and MAPE
+rmse_dynamic_00 <- sqrt(mean((actual_00 - dynamic_fc_00)^2, na.rm = TRUE))
+mae_dynamic_00 <- mean(abs(actual_00 - dynamic_fc_00), na.rm = TRUE)
+mape_dynamic_00 <- mean(abs((actual_00 - dynamic_fc_00) / actual_00), na.rm = TRUE) * 100
+
+rmse_static_00 <- sqrt(mean((actual_00 - static_fc_00)^2, na.rm = TRUE))
+mae_static_00 <- mean(abs(actual_00 - static_fc_00), na.rm = TRUE)
+mape_static_00 <- mean(abs((actual_00 - static_fc_00) / actual_00), na.rm = TRUE) * 100
+
+# print results
+cat("Forecast Accuracy Metrics:\n")
+cat("Dynamic Forecast - RMSE:", round(rmse_dynamic_00, 6),
+    "| MAE:", round(mae_dynamic_00, 6),
+    "| MAPE:", round(mape_dynamic_00, 2), "%\n")
+
+cat("Static Forecast  - RMSE:", round(rmse_static_00, 6),
+    "| MAE:", round(mae_static_00, 6),
+    "| MAPE:", round(mape_static_00, 2), "%\n")
+
+# Diebold-Mariano Test 
+dm_test <- dm.test((actual_00 - dynamic_fc_00)^2, (actual_00 - static_fc_00)^2,
+                   alternative = "two.sided", h = 1, power = 2)
+
+# print DM test results
+cat("\nDiebold-Mariano Test:\n")
+cat("Test Statistic:", round(dm_test$statistic, 4), "\n")
+cat("p-value:", round(dm_test$p.value, 4), "\n")
+
+# interpretation, using critical value at 0.05
+if (dm_test$p.value < 0.05) {
+  cat("Significant difference in forecast accuracy. Lower error method is statistically better.\n")
+} else {
+  cat("No statistically significant difference between dynamic and static forecasts.\n")
+}
+
+```
+
+The results from the ARMA(0,0) test are similar to the ones of the ARMA(4,4) model. However, to verify this more formally, we decided to run a DM test comparing the two models.
+
+```{r}
+
+dm_test <- dm.test((actual_00 - dynamic_fc_00)^2, (actual_00 - dynamic_fc)^2,
+                   alternative = "two.sided", h = 1, power = 2)
+
+cat("\nDiebold-Mariano Test:\n")
+cat("Test Statistic:", round(dm_test$statistic, 4), "\n")
+cat("p-value:", round(dm_test$p.value, 4), "\n")
+
+if (dm_test$p.value < 0.05) {
+  cat("Significant difference in forecast accuracy.\n")
+} else {
+  cat("No statistically significant difference between ARMA(0,0) and ARMA(4,4) model.\n")
+}
+```
+
+The test output has a p-value of 0.1669, above the critical 5% level, indicating that there is no evidence that one model consistently outperforms the other.
+
+# Results from LSTM Model
+
+## Predicted Price vs Actual Price
+
+The graph compares actual S&P 500 monthly prices with LSTM predictions. The model captures the overall trend well, especially from 2023 onward, but tends to smooth out short-term volatility. It slightly underestimates prices toward the end, indicating strong trend-following ability but limited responsiveness to sudden changes. The model achieves an accuracy of 96.613%.
+
+![](images/PredictedPriceVSActualPrice-01.png)
+
+## Predicted Return vs Actual Price
+
+This graph shows the actual monthly log returns versus the LSTM-predicted returns . The model captures the direction of many return movements but tends to smooth volatility and underreact to sharp spikes or drops. Despite this, it performs well overall, with a MAE of 0.008 and a RMSE 0.011, showing a strong predictive accuracy in terms of average error size.
+
+![](images/PredictedReturnsVSActualReturns-01.png)
+
+# Comparison of ARMA and LSTM Model
+
+We have created three different models to forecast the S&P 500 return. We found the LSTM to have a lower error and predict more accurately than both ARMA models. This is likely due to the LSTM's ability to capture non-linear patterns and long-term dependencies in the time series data. Additionally, LSTMs require and utilize larger datasets, which enables them to learn more complex relationships.
+
+The LSTM model, compared to the ARMA models, uses more flexible deep learning that can model complex time relationships, even when these are not explicitly visible in the autocorrelation structure. While ARMA models are effective for capturing linear dependencies and short memory, they are limited in capturing structural changes. The LSTM’s lower MAE and RMSE suggest that it adapts better to the underlying data-generating process of financial returns.
+
+# Conclusion
+
+To conclude, in this report we have set up different ARMA models, as well as a machine learning model, to forecast monthly S&P 500 returns. Specifically, we implemented one ARMA(0,0) model and an ARMA(4,4) model with more parameters, as well as and a more complex ML model based on LSTMs. The results of these were compared, and suggest that the ML model outperformed the ARMA models slightly. Nonetheless, the investigation shows that forecasting stock index returns proves a challenging task, in line with the idea of market efficiency.
+
+# Use of LLMs
+
+In this project, we utilized ChatGPT for spell-checking and enhancing the writing in the report, as well as for coding assistance and debugging tasks in the coding sections. Initially ChatGPT was also used to support idea generation, however, the core concepts and direction of the project were our own.
