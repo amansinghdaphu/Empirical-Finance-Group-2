@@ -469,7 +469,7 @@ This graph shows the actual monthly log returns versus the LSTM-predicted return
 
 We have created three different models to forecast the S&P 500 return. We found the LSTM to have a lower error and predict more accurately than both ARMA models. This is likely due to the LSTM's ability to capture non-linear patterns and long-term dependencies in the time series data. Additionally, LSTMs require and utilize larger datasets, which enables them to learn more complex relationships.
 
-The LSTM model, compared to the ARMA models, uses more flexible deep learning that can model complex time relationships, even when these are not explicitly visible in the autocorrelation structure. While ARMA models are effective for capturing linear dependencies and short memory, they are limited in capturing structural changes. The LSTM’s lower MAE and RMSE suggest that it adapts better to the underlying data-generating process of financial returns.
+The LSTM model, compared to the ARMA models, uses more flexible deep learning that can model complex time relationships, even when these are not explicitly visible in the autocorrelation structure. The LSTM’s lower MAE and RMSE suggest that it adapts better to the underlying data-generating process of financial returns.
 
 # Conclusion
 
